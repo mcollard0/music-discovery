@@ -1,0 +1,43 @@
+{
+  "media_root": "/srv/media/music",
+  "media_mount": "/srv/media",
+  "jellyfin_database": "/var/lib/jellyfin/data/jellyfin.db",
+  "state_dir": "/var/lib/music-discovery",
+  "timezone": "Etc/UTC",
+  "songs_per_run": 20,
+  "max_candidate_checks": 200,
+  "max_run_requests": 400,
+  "daily_requests": 800,
+  "request_delay": 3,
+  "download_delay_min": 30,
+  "download_delay_max": 60,
+  "minimum_free_gib": 5,
+  "maximum_file_mib": 100,
+  "minimum_duration": 60,
+  "maximum_duration": 900,
+  "yt_dlp": "/usr/bin/yt-dlp",
+  "tags": {
+    "edm": [
+      "edm",
+      "deep house",
+      "trance",
+      "drum and bass",
+      "electro house",
+      "progressive house"
+    ],
+    "80s": [
+      "80s"
+    ],
+    "90s": [
+      "90s"
+    ]
+  },
+  "user_agent": "MusicDiscovery/1.0",
+  "install_dir": "/opt/music-discovery",
+  "download_user": "music",
+  "service_user": "jellyfin",
+  "service_group": "jellyfin",
+  "lyrics_install_dir": "/var/lib/jellyfin/finamp-lyrics",
+  "jellyfin_url": "http://localhost:8096",
+  "schedule_time": "04:00:00"
+}

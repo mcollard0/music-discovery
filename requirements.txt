@@ -1,0 +1,4 @@
+requests>=2.31
+beautifulsoup4>=4.12
+mutagen>=1.47
+# System executables: yt-dlp, ffmpeg, systemd. Existing Finamp worker manages Genius.

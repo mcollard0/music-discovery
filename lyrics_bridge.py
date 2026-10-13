@@ -39,7 +39,10 @@ def bridge(config):
         installed = Path(config.get("lyrics_install_dir", "/var/lib/jellyfin/finamp-lyrics"))
         credentials = json.loads((installed / "credentials.json").read_text())
         session = requests.Session()
-        session.headers.update({"X-Emby-Token": credentials["JELLYFIN_API_KEY"],
+        session.headers.update({"Authorization":
+                                'MediaBrowser Client="MusicDiscoveryLyrics", Device="Local", '
+                                'DeviceId="music-discovery-lyrics", Version="1.0", '
+                                f'Token="{credentials["JELLYFIN_API_KEY"]}"',
                                 "User-Agent": "MusicDiscoveryLyrics/1.0"})
         base = config.get("jellyfin_url", "http://localhost:8096").rstrip("/")
         os.environ["JELLYFIN_API_KEY"] = credentials["JELLYFIN_API_KEY"]

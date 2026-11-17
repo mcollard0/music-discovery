@@ -3,6 +3,7 @@
   "media_mount": "/srv/media",
   "jellyfin_database": "/var/lib/jellyfin/data/jellyfin.db",
   "state_dir": "/var/lib/music-discovery",
+  "request_dir": "/var/lib/music-discovery/requests",
   "timezone": "Etc/UTC",
   "songs_per_run": 20,
   "max_candidate_checks": 200,
@@ -15,6 +16,10 @@
   "maximum_file_mib": 100,
   "minimum_duration": 60,
   "maximum_duration": 900,
+  "youtube_search_results": 10,
+  "trusted_official_channels": [
+    "UKF Dubstep"
+  ],
   "yt_dlp": "/usr/bin/yt-dlp",
   "tags": {
     "edm": [
@@ -39,5 +44,10 @@
   "service_group": "jellyfin",
   "lyrics_install_dir": "/var/lib/jellyfin/finamp-lyrics",
   "jellyfin_url": "http://localhost:8096",
+  "telegram_summary": {
+    "environment_file": "/etc/music-discovery/telegram.env",
+    "bot_token_env": "TELEGRAM_API_KEY",
+    "chat_id_env": "TELEGRAM_CHAT_ID"
+  },
   "schedule_time": "04:00:00"
 }

@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import html
 import itertools
 import json
 import logging
@@ -12,6 +13,7 @@ import random
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,6 +33,14 @@ from mutagen.mp3 import MP3
 
 LOG = logging.getLogger("music-discovery")
 CATEGORIES = ("edm", "80s", "90s")
+TELEGRAM_MESSAGE_LIMIT = 4096
+FAILED_CANDIDATE_RETRY_SECONDS = 7 * 86400
+DEFAULT_YOUTUBE_SEARCH_RESULTS = 10
+DEFAULT_TRUSTED_OFFICIAL_CHANNELS = ("UKF Dubstep",)
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+REQUEST_MAX_BYTES = 4096
+REQUEST_FIELD_MAX = 200
+REQUEST_RESULT_RETENTION_SECONDS = 7 * 86400
 
 
 class StopRun(RuntimeError):
@@ -41,6 +51,10 @@ def normalize(value):
     value = unicodedata.normalize("NFKD", value).casefold()
     value = "".join(c for c in value if not unicodedata.combining(c))
     return " ".join(re.findall(r"\w+", value))
+
+def matching_title(value):
+    return normalize(re.sub(r"\([^)]*\)", " ", value))
+
 
 
 def identity(artist, title):
@@ -66,6 +80,68 @@ def atomic_json(path, value, mode=0o640):
         os.replace(temporary, path)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+def summary_track(track, detail=None):
+    item = {"artist": track.get("artist", "Unknown"), "title": track.get("title", "Unknown"),
+            "category": track.get("category", "unknown")}
+    if detail:
+        item["detail"] = str(detail)
+    return item
+
+
+def new_summary():
+    return {"searched": [], "already_present": [], "failures": [], "added": []}
+
+
+def summary_counts(summary):
+    return {key: len(summary[key]) for key in ("searched", "already_present", "failures", "added")}
+
+
+def telegram_message(summary, heading="Music discovery daily summary"):
+    counts = summary_counts(summary)
+    lines = [f"<b>{html.escape(heading)}</b>",
+             f"Searched: {counts['searched']}",
+             f"Already present: {counts['already_present']}",
+             f"Failures: {counts['failures']}",
+             f"Added: {counts['added']}"]
+    if summary["added"]:
+        lines.append("")
+        lines.append("<b>Added tracks</b>")
+        for index, track in enumerate(summary["added"]):
+            text = f"• {html.escape(track['artist'])} — {html.escape(track['title'])}"
+            if track.get("category"):
+                text += f" <i>({html.escape(track['category'])})</i>"
+            remaining = len(summary["added"]) - index - 1
+            suffix = f"\n… {remaining} additional track(s) omitted" if remaining else ""
+            if len("\n".join(lines + [text]) + suffix) > TELEGRAM_MESSAGE_LIMIT:
+                if remaining:
+                    lines.append(f"… {remaining + 1} additional track(s) omitted")
+                break
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def send_telegram_summary(config, summary, heading="Music discovery daily summary"):
+    settings = config.get("telegram_summary", {})
+    token = os.environ.get(settings.get("bot_token_env", "TELEGRAM_API_KEY"))
+    chat_id = os.environ.get(settings.get("chat_id_env", "TELEGRAM_CHAT_ID"))
+    if not token or not chat_id:
+        LOG.warning("Telegram summary not sent: configured environment variables are unavailable")
+        return False
+    try:
+        response = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                                 data={"chat_id": chat_id, "text": telegram_message(summary, heading),
+                                       "parse_mode": "HTML", "disable_web_page_preview": "true"},
+                                 timeout=(10, 30))
+        response.raise_for_status()
+        if not response.json().get("ok"):
+            LOG.warning("Telegram summary was rejected by the API")
+            return False
+    except (requests.RequestException, ValueError):
+        LOG.warning("Telegram summary failed: %s", sys.exc_info()[0].__name__)
+        return False
+    LOG.info("Telegram summary sent")
+    return True
 
 
 class State:
@@ -105,6 +181,8 @@ class State:
                 ("migration", row["artist"], row["title"], normalize(row["artist"]),
                  normalize(row["title"]), "legacy", row["status"], row["updated"], row["detail"], row["url"]))
         self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS track_artist_title ON tracks(artist_key,title_key)")
+        self.db.execute("UPDATE tracks SET retry_at=MAX(retry_at,updated+?) WHERE status='error'",
+                        (FAILED_CANDIDATE_RETRY_SECONDS,))
         self.db.execute("INSERT OR IGNORE INTO daily(day) VALUES(?)", (self.today,))
         self.db.execute("DELETE FROM attempt_history WHERE attempted_at<?", (time.time() - 90 * 86400,))
         self.db.commit()
@@ -379,20 +457,21 @@ def metadata(network, track):
                 cached["year"] = int(date[:4])
         network.state.cache(key, cached, 30 * 86400)
     track.update(cached)
-    if track["category"] in ("80s", "90s"):
+    if track.get("category") in ("80s", "90s"):
         lower = 1980 if track["category"] == "80s" else 1990
         if not lower <= track.get("year", 0) <= lower + 9:
             raise ValueError("Original release year is missing or outside the selected decade")
 
 
-def recording_matches(info, track):
+def recording_matches(info, track, trusted_channels=DEFAULT_TRUSTED_OFFICIAL_CHANNELS):
     if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming", "post_live"):
         return False
     duration = info.get("duration")
     if not isinstance(duration, (int, float)):
         return False
-    title = normalize(info.get("title", ""))
-    wanted = normalize(track["title"])
+    raw_title = info.get("title", "")
+    title = matching_title(raw_title)
+    wanted = matching_title(track["title"])
     artist = normalize(track["artist"])
     excluded = ("cover", "karaoke", "nightcore", "sped up", "slowed", "reaction", "tutorial", "dj set", "full album")
     if any(word in title and word not in wanted for word in excluded):
@@ -400,41 +479,64 @@ def recording_matches(info, track):
     for version in ("remix", "live", "extended", "acoustic", "instrumental", "radio edit", "original mix"):
         if (version in title) != (version in wanted):
             return False
-    if info.get("track") and normalize(info["track"]) == wanted:
+    if info.get("track") and matching_title(info["track"]) == wanted:
         artists = normalize(info.get("artist") or info.get("artists") and " ".join(info["artists"]) or "")
         if artist in artists:
             return True
     # Explicit artist/title credit with only conventional video suffixes is acceptable.
-    cleaned = re.sub(r"\b(official music video|official video|official audio|music video|lyric video|lyrics|audio|hd|hq|4k|visualizer)\b", " ", title)
+    title_without_featured_artist = re.sub(r"[\[(]\s*(?:ft\.?|feat\.?|featuring)\s+[^)\]]*[\])]", " ", raw_title, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(official music video|official video|official audio|music video|lyric video|lyrics|audio|hd|hq|4k|visualizer)\b",
+                     " ", matching_title(title_without_featured_artist))
     cleaned = " ".join(cleaned.split())
-    if cleaned not in (artist + " " + wanted, wanted + " " + artist, wanted):
+    featured_suffixes = (" ft ", " feat ", " featuring ")
+    expected_credits = (artist + " " + wanted, wanted + " " + artist, wanted)
+    if cleaned not in expected_credits and not any(cleaned.startswith(credit + suffix) for credit in expected_credits for suffix in featured_suffixes):
         return False
     channel = normalize(info.get("channel") or info.get("uploader") or "")
-    return artist in channel and ("topic" in channel or "vevo" in channel or channel in (artist, artist + " official"))
+    trusted = {normalize(channel_name) for channel_name in trusted_channels}
+    return channel in trusted or artist in channel and ("topic" in channel or "vevo" in channel or channel in (artist, artist + " official"))
 
 
 def find_video(network, track):
     if track.get("url"):
         info = json.loads(network.yt(["--skip-download", "--dump-single-json", track["url"]]))
-        if not recording_matches(info, track):
+        if not recording_matches(info, track, network.config.get("trusted_official_channels", DEFAULT_TRUSTED_OFFICIAL_CHANNELS)):
             raise ValueError("Explicit URL does not match artist/title/version and official channel")
     else:
-        query = f'ytsearch3:{track["artist"]} {track["title"]} official audio'
+        search_results = network.config.get("youtube_search_results", DEFAULT_YOUTUBE_SEARCH_RESULTS)
+        if not isinstance(search_results, int) or search_results < 1:
+            raise ValueError("youtube_search_results must be a positive integer")
+        query = f'ytsearch{search_results}:{track["artist"]} {track["title"]} official audio'
         result = json.loads(network.yt(["--flat-playlist", "--skip-download", "--dump-single-json", query]))
         info = None
         for entry in result.get("entries", []):
             duration = entry.get("duration")
             if duration and not network.config["minimum_duration"] <= duration <= network.config["maximum_duration"]:
                 continue
-            if not recording_matches(entry, track):
+            if not recording_matches(entry, track, network.config.get("trusted_official_channels", DEFAULT_TRUSTED_OFFICIAL_CHANNELS)):
                 continue
             url = entry.get("webpage_url") or entry.get("url") or f'https://www.youtube.com/watch?v={entry["id"]}'
             candidate = json.loads(network.yt(["--skip-download", "--dump-single-json", url]))
-            if recording_matches(candidate, track):
+            if recording_matches(candidate, track, network.config.get("trusted_official_channels", DEFAULT_TRUSTED_OFFICIAL_CHANNELS)):
                 info = candidate
                 break
         if info is None:
-            raise ValueError("No unambiguous official recording in the first three search results")
+            # Fallback: try without "official audio" suffix if the first search failed
+            query = f'ytsearch{search_results}:{track["artist"]} {track["title"]}'
+            result = json.loads(network.yt(["--flat-playlist", "--skip-download", "--dump-single-json", query]))
+            for entry in result.get("entries", []):
+                duration = entry.get("duration")
+                if duration and not network.config["minimum_duration"] <= duration <= network.config["maximum_duration"]:
+                    continue
+                if not recording_matches(entry, track, network.config.get("trusted_official_channels", DEFAULT_TRUSTED_OFFICIAL_CHANNELS)):
+                    continue
+                url = entry.get("webpage_url") or entry.get("url") or f'https://www.youtube.com/watch?v={entry["id"]}'
+                candidate = json.loads(network.yt(["--skip-download", "--dump-single-json", url]))
+                if recording_matches(candidate, track, network.config.get("trusted_official_channels", DEFAULT_TRUSTED_OFFICIAL_CHANNELS)):
+                    info = candidate
+                    break
+        if info is None:
+            raise ValueError(f"No unambiguous official recording in the first {search_results} search results")
     if not network.config["minimum_duration"] <= info["duration"] <= network.config["maximum_duration"]:
         raise ValueError("Recording duration is outside song limits")
     track["url"] = info["webpage_url"]
@@ -490,7 +592,9 @@ def download(network, track):
             media.add_tags()
         media.tags["title"], media.tags["artist"] = [track["title"]], [track["artist"]]
         media.tags["albumartist"], media.tags["album"] = [track["artist"]], [album]
-        media.tags["genre"] = [track.get("source_tag") or track["category"]]
+        genre = track.get("source_tag") or track.get("category")
+        if genre:  # explicit requests carry no category: leave genre untagged rather than guess "edm"
+            media.tags["genre"] = [genre]
         if track.get("year"):
             media.tags["date"] = [str(track["year"])]
             media.tags["originaldate"] = [str(track["year"])]
@@ -516,13 +620,19 @@ def download(network, track):
 
 
 def run(config, args):
+    song_limit = getattr(args, "song_limit", None)
+    if song_limit is not None:
+        config = {**config, "songs_per_run": song_limit}
     with contextlib.closing(State(config["state_dir"], config["timezone"], "preview" if args.dry_run else "download")) as state, \
          (Path(config["state_dir"]) / "run.lock").open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            LOG.info("Another run is active; exiting")
-            return 0
+            if not getattr(args, "wait_for_lock", False):
+                LOG.info("Another run is active; exiting")
+                return 0
+            LOG.info("Another run is active; waiting for it to finish")  # a queued request must not be dropped
+            fcntl.flock(lock, fcntl.LOCK_EX)
         ensure_media(config)
         catalog = Catalog(config["jellyfin_database"], Path(config["media_root"]))
         disk = DiskCatalog(config["media_root"])
@@ -536,6 +646,7 @@ def run(config, args):
         network = Network(config, state)
         source = [{"artist": args.artist, "title": args.title, "category": args.category, "url": args.url}] if args.artist else itertools.chain(state.ready_tracks(), candidates(network))
         processed = []
+        summary = new_summary()
         checked = 0
         seen = set()
         target = state.remaining(config["songs_per_run"])
@@ -552,6 +663,7 @@ def run(config, args):
                 previous = state.track(track)
                 if catalog.contains(track) or disk.contains(track) or (previous and previous["status"] == "downloaded" and previous["path"] and Path(previous["path"]).is_file()):
                     state.record_attempt(track, "owned")
+                    summary["already_present"].append(summary_track(track))
                     LOG.info("Already owned: %s — %s", track["artist"], track["title"])
                     continue
                 if previous and previous["retry_at"] > time.time() and not args.retry:
@@ -563,20 +675,23 @@ def run(config, args):
                     break
                 state.increment("candidates")
                 checked += 1
+                summary["searched"].append(summary_track(track))
                 try:
-                    verified = previous and previous["status"] == "eligible" and previous["payload"] and previous["updated"] > time.time() - 86400
+                    verified = not args.url and previous and previous["status"] == "eligible" and previous["payload"] and previous["updated"] > time.time() - 86400
                     if verified:
-                        track.update(json.loads(previous["payload"]))
+                        # Keep this invocation's category: a cached payload may carry a chart or older default category.
+                        track.update({k: v for k, v in json.loads(previous["payload"]).items() if k not in ("category", "source_tag")})
                         LOG.info("Reusing verified candidate: %s — %s", track["artist"], track["title"])
                     else:
                         try:
                             metadata(network, track)
                         except requests.RequestException:
-                            if track["category"] != "edm":
+                            if track.get("category") in ("80s", "90s"):  # only decade checks need MusicBrainz
                                 raise
-                            LOG.warning("MusicBrainz unavailable; continuing EDM candidate without optional recording/year tags")
+                            LOG.warning("MusicBrainz unavailable; continuing without optional recording/year tags")
                     if catalog.contains(track):
                         state.remember(track, "owned", retry=30 * 86400)
+                        summary["already_present"].append(summary_track(track))
                         LOG.info("Existing MusicBrainz recording: %s — %s", track["artist"], track["title"])
                         continue
                     if not verified:
@@ -588,6 +703,7 @@ def run(config, args):
                     else:
                         download(network, track)
                         catalog.keys.add(key)
+                        summary["added"].append(summary_track(track))
                         processed.append(track)
                     if len(processed) >= target:
                         stop_reason = "goal_reached"
@@ -595,7 +711,8 @@ def run(config, args):
                 except StopRun:
                     raise
                 except (requests.RequestException, subprocess.SubprocessError, RuntimeError, ValueError, OSError, MutagenError) as exc:
-                    state.remember(track, "error", detail=str(exc), retry=86400)
+                    state.remember(track, "error", detail=str(exc), retry=FAILED_CANDIDATE_RETRY_SECONDS)
+                    summary["failures"].append(summary_track(track, type(exc).__name__))
                     LOG.warning("Skipped %s — %s: %s", track["artist"], track["title"], exc)
             if len(processed) >= target:
                 stop_reason = "goal_reached"
@@ -607,14 +724,119 @@ def run(config, args):
         report = {"time": datetime.now(ZoneInfo(config["timezone"])).isoformat(),
                   "mode": state.mode, "run_id": state.run_id, "goal": config["songs_per_run"],
                   "target_this_run": target, "checked_this_run": checked, "stop_reason": stop_reason,
-                  "daily": state.counts(), "processed": processed}
+                  "daily": state.counts(), "processed": processed,
+                  "summary": {"counts": summary_counts(summary), "added": summary["added"]}}
         atomic_json(state.directory / "last-run.json", report)
+        if args.telegram_summary:
+            report["telegram_summary"] = {"requested": True,
+                                          "sent": send_telegram_summary(config, summary)}
+            atomic_json(state.directory / "last-run.json", report)
         print(json.dumps(report, ensure_ascii=False))
+        if isinstance(getattr(args, "report", None), dict):
+            args.report.update(report)
         if args.artist and not processed and not catalog.contains(source[0]) and not disk.contains(source[0]):
             row = state.track(source[0])
             if not row or row["status"] != "downloaded" or not row["path"] or not Path(row["path"]).is_file():
                 return 1
         return 0
+
+
+def request_dir(config):
+    return Path(config.get("request_dir") or Path(config["state_dir"]) / "requests")
+
+
+def read_request(path):
+    """Parse one queued request without following links (the directory is shared with a container)."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("request is not a regular file")
+        body = stream.read(REQUEST_MAX_BYTES + 1)
+    if len(body) > REQUEST_MAX_BYTES:
+        raise ValueError("request is too large")
+    request = json.loads(body)
+    if not isinstance(request, dict):
+        raise ValueError("request is not a JSON object")
+    for field in ("artist", "title"):
+        value = request.get(field)
+        if not isinstance(value, str) or not value.strip() or len(value) > REQUEST_FIELD_MAX:
+            raise ValueError(f"request {field} must be 1-{REQUEST_FIELD_MAX} characters")
+    if request.get("category") not in (None, *CATEGORIES):
+        raise ValueError("request category is not supported")
+    if not isinstance(request.get("dry_run", False), bool):
+        raise ValueError("request dry_run must be true or false")
+    return request
+
+
+def request_outcome(config, track, code, report):
+    """Summarize a single-song run as outcome + detail for the requester."""
+    counts = (report.get("summary") or {}).get("counts") or {}
+    row = None
+    database = Path(config["state_dir"]) / "history.sqlite3"
+    if database.exists():
+        with contextlib.closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT status,detail,path,url,retry_at FROM tracks WHERE artist_key=? AND title_key=?",
+                             (normalize(track["artist"]), normalize(track["title"]))).fetchone()
+    result = {"returncode": code, "stop_reason": report.get("stop_reason"),
+              "path": row["path"] if row else None, "url": (report.get("processed") or [{}])[0].get("url") or (row["url"] if row else None)}
+    if not report:
+        return {**result, "outcome": "error", "detail": "music discovery produced no report"}
+    if counts.get("added"):
+        return {**result, "outcome": "added", "detail": ""}
+    if counts.get("already_present"):
+        return {**result, "outcome": "already_present", "detail": ""}
+    if report.get("mode") == "preview" and report.get("processed"):
+        return {**result, "outcome": "found", "detail": ""}
+    if report.get("stop_reason") not in ("goal_reached", "sources_exhausted"):
+        return {**result, "outcome": "stopped", "detail": str(report.get("stop_reason"))}
+    if not report.get("checked_this_run") and row and row["retry_at"] > time.time():
+        return {**result, "outcome": "deferred", "detail": f"tried recently ({row['detail'] or row['status']}); retry after {datetime.fromtimestamp(row['retry_at'], ZoneInfo(config['timezone'])).strftime('%Y-%m-%d %H:%M')}"}
+    return {**result, "outcome": "failed", "detail": (row["detail"] if row and row["detail"] else "no unambiguous official recording found")}
+
+
+def process_requests(config):
+    """Run every queued single-song request (<id>.json) in arrival order; write results/<id>.json and remove the request."""
+    directory = request_dir(config)
+    results = directory / "results"
+    results.mkdir(exist_ok=True)
+    for old in results.glob("*.json"):
+        with contextlib.suppress(OSError):
+            if old.stat().st_mtime < time.time() - REQUEST_RESULT_RETENTION_SECONDS:
+                old.unlink()
+    processed = 0
+    while True:
+        pending = sorted((p for p in directory.glob("*.json") if REQUEST_ID_PATTERN.match(p.stem)),
+                         key=lambda p: p.lstat().st_mtime)
+        if not pending:
+            return processed
+        path = pending[0]
+        started = time.time()
+        result = {"id": path.stem, "started_at": started}
+        try:
+            request = read_request(path)
+            result.update({"artist": request["artist"].strip(), "title": request["title"].strip(),
+                           "requested_at": request.get("requested_at"), "dry_run": request.get("dry_run", False)})
+            args = argparse.Namespace(dry_run=result["dry_run"], artist=result["artist"], title=result["title"],
+                                      category=request.get("category"), url=None, retry=False, candidate_limit=None,
+                                      song_limit=1, telegram_summary=False, wait_for_lock=True, report={})
+            LOG.info("Processing song request %s: %s — %s", path.stem, result["artist"], result["title"])
+            try:
+                code = run(config, args)
+            except (OSError, sqlite3.Error, StopRun) as exc:
+                LOG.error("Song request %s failed: %s", path.stem, exc)
+                result.update({"outcome": "error", "detail": str(exc), "returncode": 1})
+            else:
+                result.update(request_outcome(config, result, code, args.report))
+        except (OSError, ValueError) as exc:  # unreadable or malformed: answer it so the requester is not left waiting
+            LOG.warning("Rejected song request %s: %s", path.stem, exc)
+            result.update({"outcome": "invalid", "detail": str(exc)})
+        result["finished_at"] = time.time()
+        atomic_json(results / path.name, result, mode=0o644)
+        # Always remove the request, even after a failure: a lingering file would retrigger the path unit forever.
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        processed += 1
 
 
 def main():
@@ -624,10 +846,15 @@ def main():
     parser.add_argument("--artist")
     parser.add_argument("--title")
     parser.add_argument("--url")
-    parser.add_argument("--category", choices=CATEGORIES, default="edm")
+    parser.add_argument("--category", choices=CATEGORIES, default=None,
+                        help="With --artist/--title: tag and validate as this category (80s/90s require a matching MusicBrainz year). Default: no category or genre tag")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--retry", action="store_true", help="Retry one explicitly selected failed candidate; daily limits still apply")
     parser.add_argument("--candidate-limit", type=int, help="Lower the number of candidate checks for this invocation")
+    parser.add_argument("--song-limit", type=int, help="Override this invocation's successful-download goal")
+    parser.add_argument("--telegram-summary", action="store_true", help="Send a Telegram summary after this run")
+    parser.add_argument("--test-telegram-summary", action="store_true", help="Send a no-download Telegram delivery test")
+    parser.add_argument("--process-requests", action="store_true", help="Run queued single-song requests from the request directory (used by music-discovery-request.path)")
     args = parser.parse_args()
     if bool(args.artist) != bool(args.title) or (args.url and not args.artist):
         parser.error("artist/title must be supplied together; URL requires both")
@@ -635,8 +862,21 @@ def main():
         parser.error("--retry requires an explicit artist/title")
     if args.candidate_limit is not None and args.candidate_limit < 1:
         parser.error("--candidate-limit must be positive")
+    if args.song_limit is not None and args.song_limit < 1:
+        parser.error("--song-limit must be positive")
     config = json.loads(args.config.read_text())
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if args.process_requests:
+        try:
+            LOG.info("Processed %d song request(s)", process_requests(config))
+            return 0
+        except (OSError, sqlite3.Error) as exc:
+            LOG.error("Request processing failed: %s", exc)
+            return 1
+    if args.test_telegram_summary:
+        sent = send_telegram_summary(config, new_summary(), "Music discovery Telegram delivery test")
+        print(json.dumps({"mode": "telegram-test", "telegram_summary": {"sent": sent}}))
+        return 0 if sent else 1
     if args.status:
         database = Path(config["state_dir"]) / "history.sqlite3"
         if not database.exists():

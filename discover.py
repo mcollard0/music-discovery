@@ -2,6 +2,7 @@
 """Bounded daily music discovery, read-only Jellyfin deduplication and downloads."""
 import argparse
 import contextlib
+import difflib
 import fcntl
 import hashlib
 import html
@@ -275,23 +276,31 @@ class State:
 class Catalog:
     def __init__(self, database, root):
         self.keys, self.recordings = set(), set()
-        # mode=ro, not immutable: Jellyfin's active WAL must remain visible.
-        with contextlib.closing(sqlite3.connect(Path(database).as_uri() + "?mode=ro", uri=True, timeout=10)) as db:
-            columns = {r[1] for r in db.execute("PRAGMA table_info(BaseItems)")}
-            if not {"Name", "Artists", "AlbumArtists", "Path", "MediaType"} <= columns:
-                raise StopRun("Jellyfin database schema changed; refusing unchecked downloads")
-            rows = db.execute("SELECT Name,Artists,AlbumArtists,Path FROM BaseItems WHERE MediaType='Audio'")
-            for title, artists, album_artists, path in rows:
-                if not path or not Path(path).is_relative_to(root):
-                    continue
-                for artist in re.split(r"[|;\\]", artists or album_artists or ""):
-                    if artist.strip():
-                        self.keys.add(identity(artist.strip(), title or ""))
-                # Also keep the full artist credit, for collaborations.
-                self.keys.add(identity(artists or album_artists or "", title or ""))
-            self.recordings = {r[0] for r in db.execute("""SELECT p.ProviderValue FROM BaseItemProviders p
-                JOIN BaseItems b ON b.Id=p.ItemId WHERE p.ProviderId='MusicBrainzTrack'
-                AND b.MediaType='Audio'""")}
+        # Snapshot the DB and any active WAL into temporary space so read-only queries never need write access to Jellyfin's data directory.
+        source = Path(database)
+        with tempfile.TemporaryDirectory(prefix="jellyfin-catalog-") as temporary:
+            snapshot = Path(temporary) / source.name
+            for suffix in ("", "-wal", "-shm"):
+                candidate = Path(str(source) + suffix)
+                with contextlib.suppress(FileNotFoundError):
+                    shutil.copyfile(candidate, Path(str(snapshot) + suffix))
+            uri = snapshot.as_uri() + ("?mode=ro" if Path(str(snapshot) + "-wal").exists() else "?mode=ro&immutable=1")
+            with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=10)) as db:
+                columns = {r[1] for r in db.execute("PRAGMA table_info(BaseItems)")}
+                if not {"Name", "Artists", "AlbumArtists", "Path", "MediaType"} <= columns:
+                    raise StopRun("Jellyfin database schema changed; refusing unchecked downloads")
+                rows = db.execute("SELECT Name,Artists,AlbumArtists,Path FROM BaseItems WHERE MediaType='Audio'")
+                for title, artists, album_artists, path in rows:
+                    if not path or not Path(path).is_relative_to(root):
+                        continue
+                    for artist in re.split(r"[|;\\]", artists or album_artists or ""):
+                        if artist.strip():
+                            self.keys.add(identity(artist.strip(), title or ""))
+                    # Also keep the full artist credit, for collaborations.
+                    self.keys.add(identity(artists or album_artists or "", title or ""))
+                self.recordings = {r[0] for r in db.execute("""SELECT p.ProviderValue FROM BaseItemProviders p
+                    JOIN BaseItems b ON b.Id=p.ItemId WHERE p.ProviderId='MusicBrainzTrack'
+                    AND b.MediaType='Audio'""")}
 
     def contains(self, track):
         return identity(track["artist"], track["title"]) in self.keys or (
@@ -380,7 +389,7 @@ class Network:
         self.pace()
         command = [self.config["yt_dlp"], "--ignore-config", "--no-playlist", "--no-progress",
                    "--sleep-requests", str(self.config["request_delay"]), "--socket-timeout", "30",
-                   "--retries", "1", "--fragment-retries", "1", *arguments]
+                   "--retries", "3", "--fragment-retries", "3", *arguments]
         result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
         if result.returncode:
             if "429" in result.stderr or "Too Many Requests" in result.stderr:
@@ -463,6 +472,30 @@ def metadata(network, track):
             raise ValueError("Original release year is missing or outside the selected decade")
 
 
+def mix_preference(info, track):
+    """When no mix (original/remix/radio edit) is requested, prefer original (0) over remix or radio edit (1)."""
+    wanted_full = normalize(track.get("title", ""))
+    if "original mix" in wanted_full or "remix" in wanted_full or "radio edit" in wanted_full:
+        return 0
+    raw_full = normalize(info.get("title", "") + " " + (info.get("track") or ""))
+    return 1 if ("remix" in raw_full or "radio edit" in raw_full) and "original mix" not in raw_full else 0
+
+
+def artist_matches(candidate, wanted):
+    candidate, wanted = normalize(candidate), normalize(wanted)
+    if not candidate or not wanted:
+        return False
+    if wanted in candidate:
+        return True
+    candidate_words, wanted_words = candidate.split(), wanted.split()
+    for index in range(len(candidate_words) - len(wanted_words) + 1):
+        window = candidate_words[index:index + len(wanted_words)]
+        if all(cw == ww or (len(ww) >= 4 and sorted(cw) == sorted(ww) and difflib.SequenceMatcher(None, cw, ww).ratio() >= 0.75)
+               for cw, ww in zip(window, wanted_words)):
+            return True
+    return False
+
+
 def recording_matches(info, track, trusted_channels=DEFAULT_TRUSTED_OFFICIAL_CHANNELS):
     if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming", "post_live"):
         return False
@@ -472,69 +505,83 @@ def recording_matches(info, track, trusted_channels=DEFAULT_TRUSTED_OFFICIAL_CHA
     raw_title = info.get("title", "")
     title = matching_title(raw_title)
     wanted = matching_title(track["title"])
+    raw_full = normalize(raw_title)
+    wanted_full = normalize(track["title"])
     artist = normalize(track["artist"])
     excluded = ("cover", "karaoke", "nightcore", "sped up", "slowed", "reaction", "tutorial", "dj set", "full album")
     if any(word in title and word not in wanted for word in excluded):
         return False
-    for version in ("remix", "live", "extended", "acoustic", "instrumental", "radio edit", "original mix"):
+    for version in ("live", "extended", "acoustic", "instrumental"):
         if (version in title) != (version in wanted):
             return False
+    if "original mix" in wanted_full and ("remix" in raw_full or "radio edit" in raw_full):
+        return False
+    if "remix" in wanted_full and "remix" not in raw_full:
+        return False
+    if "radio edit" in wanted_full and "radio edit" not in raw_full:
+        return False
     if info.get("track") and matching_title(info["track"]) == wanted:
         artists = normalize(info.get("artist") or info.get("artists") and " ".join(info["artists"]) or "")
-        if artist in artists:
+        if artist_matches(artists, artist):
             return True
-    # Explicit artist/title credit with only conventional video suffixes is acceptable.
+    # Explicit artist/title credit with only conventional video/mix suffixes is acceptable.
     title_without_featured_artist = re.sub(r"[\[(]\s*(?:ft\.?|feat\.?|featuring)\s+[^)\]]*[\])]", " ", raw_title, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(official music video|official video|official audio|music video|lyric video|lyrics|audio|hd|hq|4k|visualizer)\b",
+    cleaned = re.sub(r"\b(official music video|official video|official audio|music video|lyric video|lyrics|audio|hd|hq|4k|visualizer|original mix|remix|radio edit)\b",
                      " ", matching_title(title_without_featured_artist))
     cleaned = " ".join(cleaned.split())
     featured_suffixes = (" ft ", " feat ", " featuring ")
-    expected_credits = (artist + " " + wanted, wanted + " " + artist, wanted)
-    if cleaned not in expected_credits and not any(cleaned.startswith(credit + suffix) for credit in expected_credits for suffix in featured_suffixes):
+    title_ok = False
+    for expected in (artist + " " + wanted, wanted + " " + artist, wanted):
+        if cleaned == expected or any(cleaned.startswith(expected + suffix) for suffix in featured_suffixes):
+            title_ok = True
+            break
+    if not title_ok and " - " in raw_title:
+        lead_artist, _, rest_title = raw_title.partition(" - ")
+        rest_without_feat = re.sub(r"[\[(]\s*(?:ft\.?|feat\.?|featuring)\s+[^)\]]*[\])]", " ", rest_title, flags=re.IGNORECASE)
+        rest_cleaned = " ".join(re.sub(r"\b(official music video|official video|official audio|music video|lyric video|lyrics|audio|hd|hq|4k|visualizer|original mix|remix|radio edit)\b",
+                                       " ", matching_title(rest_without_feat)).split())
+        if artist_matches(lead_artist, artist) and (rest_cleaned == wanted or any(rest_cleaned.startswith(wanted + suffix) for suffix in featured_suffixes)):
+            title_ok = True
+    if not title_ok:
         return False
     channel = normalize(info.get("channel") or info.get("uploader") or "")
     trusted = {normalize(channel_name) for channel_name in trusted_channels}
-    return channel in trusted or artist in channel and ("topic" in channel or "vevo" in channel or channel in (artist, artist + " official"))
+    if channel in trusted:
+        return True
+    channel_core = " ".join(w for w in channel.split() if w not in ("topic", "vevo", "official"))
+    return artist_matches(channel, artist) and ("topic" in channel or "vevo" in channel or artist_matches(channel_core, artist) and len(channel_core.split()) == len(artist.split()))
 
 
 def find_video(network, track):
+    trusted_channels = network.config.get("trusted_official_channels", DEFAULT_TRUSTED_OFFICIAL_CHANNELS)
     if track.get("url"):
         info = json.loads(network.yt(["--skip-download", "--dump-single-json", track["url"]]))
-        if not recording_matches(info, track, network.config.get("trusted_official_channels", DEFAULT_TRUSTED_OFFICIAL_CHANNELS)):
+        if not recording_matches(info, track, trusted_channels):
             raise ValueError("Explicit URL does not match artist/title/version and official channel")
     else:
         search_results = network.config.get("youtube_search_results", DEFAULT_YOUTUBE_SEARCH_RESULTS)
         if not isinstance(search_results, int) or search_results < 1:
             raise ValueError("youtube_search_results must be a positive integer")
-        query = f'ytsearch{search_results}:{track["artist"]} {track["title"]} official audio'
-        result = json.loads(network.yt(["--flat-playlist", "--skip-download", "--dump-single-json", query]))
+        queries = (f'ytsearch{search_results}:{track["artist"]} {track["title"]} official audio',
+                   f'ytsearch{search_results}:{track["artist"]} {track["title"]}')
         info = None
-        for entry in result.get("entries", []):
-            duration = entry.get("duration")
-            if duration and not network.config["minimum_duration"] <= duration <= network.config["maximum_duration"]:
-                continue
-            if not recording_matches(entry, track, network.config.get("trusted_official_channels", DEFAULT_TRUSTED_OFFICIAL_CHANNELS)):
-                continue
-            url = entry.get("webpage_url") or entry.get("url") or f'https://www.youtube.com/watch?v={entry["id"]}'
-            candidate = json.loads(network.yt(["--skip-download", "--dump-single-json", url]))
-            if recording_matches(candidate, track, network.config.get("trusted_official_channels", DEFAULT_TRUSTED_OFFICIAL_CHANNELS)):
-                info = candidate
-                break
-        if info is None:
-            # Fallback: try without "official audio" suffix if the first search failed
-            query = f'ytsearch{search_results}:{track["artist"]} {track["title"]}'
+        for query in queries:
             result = json.loads(network.yt(["--flat-playlist", "--skip-download", "--dump-single-json", query]))
-            for entry in result.get("entries", []):
-                duration = entry.get("duration")
-                if duration and not network.config["minimum_duration"] <= duration <= network.config["maximum_duration"]:
-                    continue
-                if not recording_matches(entry, track, network.config.get("trusted_official_channels", DEFAULT_TRUSTED_OFFICIAL_CHANNELS)):
-                    continue
+            entries = [e for e in result.get("entries", [])
+                       if (not e.get("duration") or network.config["minimum_duration"] <= e["duration"] <= network.config["maximum_duration"])
+                       and recording_matches(e, track, trusted_channels)]
+            entries.sort(key=lambda e: mix_preference(e, track))
+            for entry in entries:
                 url = entry.get("webpage_url") or entry.get("url") or f'https://www.youtube.com/watch?v={entry["id"]}'
                 candidate = json.loads(network.yt(["--skip-download", "--dump-single-json", url]))
-                if recording_matches(candidate, track, network.config.get("trusted_official_channels", DEFAULT_TRUSTED_OFFICIAL_CHANNELS)):
-                    info = candidate
-                    break
+                if recording_matches(candidate, track, trusted_channels):
+                    if mix_preference(candidate, track) == 0:
+                        info = candidate
+                        break
+                    if info is None:
+                        info = candidate
+            if info is not None:
+                break
         if info is None:
             raise ValueError(f"No unambiguous official recording in the first {search_results} search results")
     if not network.config["minimum_duration"] <= info["duration"] <= network.config["maximum_duration"]:
@@ -745,8 +792,25 @@ def request_dir(config):
     return Path(config.get("request_dir") or Path(config["state_dir"]) / "requests")
 
 
+def validate_request_item(item, default_artist=None, default_category=None, default_dry_run=False):
+    if not isinstance(item, dict):
+        raise ValueError("request item is not a JSON object")
+    artist = item.get("artist") if item.get("artist") is not None else default_artist
+    title = item.get("title")
+    for field, value in (("artist", artist), ("title", title)):
+        if not isinstance(value, str) or not value.strip() or len(value) > REQUEST_FIELD_MAX:
+            raise ValueError(f"request {field} must be 1-{REQUEST_FIELD_MAX} characters")
+    category = item.get("category", default_category)
+    if category not in (None, *CATEGORIES):
+        raise ValueError("request category is not supported")
+    dry_run = item.get("dry_run", default_dry_run)
+    if not isinstance(dry_run, bool):
+        raise ValueError("request dry_run must be true or false")
+    return {"artist": artist.strip(), "title": title.strip(), "category": category, "dry_run": dry_run}
+
+
 def read_request(path):
-    """Parse one queued request without following links (the directory is shared with a container)."""
+    """Parse one queued request file (single song or batch under 'requests' / 'titles') without following links."""
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(descriptor, "rb") as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
@@ -755,17 +819,35 @@ def read_request(path):
     if len(body) > REQUEST_MAX_BYTES:
         raise ValueError("request is too large")
     request = json.loads(body)
+    if isinstance(request, list):
+        if not request:
+            raise ValueError("request list must not be empty")
+        items = [validate_request_item(item) for item in request]
+        return {"artist": items[0]["artist"], "title": items[0]["title"], "dry_run": items[0]["dry_run"],
+                "category": items[0]["category"], "requests": items}
     if not isinstance(request, dict):
         raise ValueError("request is not a JSON object")
-    for field in ("artist", "title"):
-        value = request.get(field)
-        if not isinstance(value, str) or not value.strip() or len(value) > REQUEST_FIELD_MAX:
-            raise ValueError(f"request {field} must be 1-{REQUEST_FIELD_MAX} characters")
-    if request.get("category") not in (None, *CATEGORIES):
-        raise ValueError("request category is not supported")
     if not isinstance(request.get("dry_run", False), bool):
         raise ValueError("request dry_run must be true or false")
-    return request
+    if request.get("category") not in (None, *CATEGORIES):
+        raise ValueError("request category is not supported")
+    default_artist = request.get("artist") if isinstance(request.get("artist"), str) else None
+    default_category = request.get("category")
+    default_dry_run = request.get("dry_run", False)
+    if "requests" in request:
+        raw_items = request.get("requests")
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ValueError("request requests must be a non-empty list")
+        items = [validate_request_item(item, default_artist, default_category, default_dry_run) for item in raw_items]
+        return {**request, "artist": items[0]["artist"], "title": items[0]["title"], "requests": items}
+    if "titles" in request:
+        raw_titles = request.get("titles")
+        if not isinstance(raw_titles, list) or not raw_titles:
+            raise ValueError("request titles must be a non-empty list")
+        items = [validate_request_item({"title": t}, default_artist, default_category, default_dry_run) for t in raw_titles]
+        return {**request, "artist": items[0]["artist"], "title": items[0]["title"], "requests": items}
+    item = validate_request_item(request, default_artist, default_category, default_dry_run)
+    return {**request, **item}
 
 
 def request_outcome(config, track, code, report):
@@ -796,7 +878,7 @@ def request_outcome(config, track, code, report):
 
 
 def process_requests(config):
-    """Run every queued single-song request (<id>.json) in arrival order; write results/<id>.json and remove the request."""
+    """Run every queued single-song or multi-song request (<id>.json) in arrival order; write results/<id>.json and remove the request."""
     directory = request_dir(config)
     results = directory / "results"
     results.mkdir(exist_ok=True)
@@ -815,19 +897,28 @@ def process_requests(config):
         result = {"id": path.stem, "started_at": started}
         try:
             request = read_request(path)
-            result.update({"artist": request["artist"].strip(), "title": request["title"].strip(),
-                           "requested_at": request.get("requested_at"), "dry_run": request.get("dry_run", False)})
-            args = argparse.Namespace(dry_run=result["dry_run"], artist=result["artist"], title=result["title"],
-                                      category=request.get("category"), url=None, retry=False, candidate_limit=None,
-                                      song_limit=1, telegram_summary=False, wait_for_lock=True, report={})
-            LOG.info("Processing song request %s: %s — %s", path.stem, result["artist"], result["title"])
-            try:
-                code = run(config, args)
-            except (OSError, sqlite3.Error, StopRun) as exc:
-                LOG.error("Song request %s failed: %s", path.stem, exc)
-                result.update({"outcome": "error", "detail": str(exc), "returncode": 1})
-            else:
-                result.update(request_outcome(config, result, code, args.report))
+            items = request.get("requests") or [{"artist": request["artist"], "title": request["title"],
+                                                 "category": request.get("category"), "dry_run": request.get("dry_run", False)}]
+            result.update({"artist": items[0]["artist"], "title": items[0]["title"],
+                           "requested_at": request.get("requested_at"), "dry_run": items[0]["dry_run"]})
+            item_results = []
+            for item in items:
+                item_result = {"artist": item["artist"], "title": item["title"], "dry_run": item["dry_run"]}
+                args = argparse.Namespace(dry_run=item["dry_run"], artist=item["artist"], title=item["title"],
+                                          category=item.get("category"), url=None, retry=False, candidate_limit=None,
+                                          song_limit=1, telegram_summary=False, wait_for_lock=True, report={})
+                LOG.info("Processing song request %s: %s — %s", path.stem, item["artist"], item["title"])
+                try:
+                    code = run(config, args)
+                except (OSError, sqlite3.Error, StopRun) as exc:
+                    LOG.error("Song request %s failed: %s", path.stem, exc)
+                    item_result.update({"outcome": "error", "detail": str(exc), "returncode": 1})
+                else:
+                    item_result.update(request_outcome(config, item_result, code, args.report))
+                item_results.append(item_result)
+            result.update(item_results[0])
+            if len(item_results) > 1 or "requests" in request:
+                result["results"] = item_results
         except (OSError, ValueError) as exc:  # unreadable or malformed: answer it so the requester is not left waiting
             LOG.warning("Rejected song request %s: %s", path.stem, exc)
             result.update({"outcome": "invalid", "detail": str(exc)})

@@ -243,6 +243,26 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn("artist", invalid["detail"])
         self.assertEqual(sorted(p.name for p in requests_dir.iterdir()), ["notes.txt", "results"])  # requests removed, junk untouched
 
+    def test_process_requests_supports_multi_song_batch_in_one_drop_file(self):
+        config, requests_dir = self.request_config()
+        batch = {"id": "gridshift-tg-batch", "artist": "slyvie miles", "title": "alive",
+                 "requests": [{"artist": "slyvie miles", "title": t} for t in ("alive", "breathe", "fly", "get naughty")],
+                 "requested_at": 1, "dry_run": False}
+        (requests_dir / "gridshift-tg-batch.json").write_text(json.dumps(batch))
+        calls = []
+        def fake_run(_config, args):
+            calls.append((args.artist, args.title))
+            args.report.update({"mode": "download", "stop_reason": "goal_reached", "checked_this_run": 1,
+                                "processed": [{"url": f"https://example.invalid/{args.title}"}], "summary": {"counts": {"added": 1}}})
+            return 0
+        with patch("discover.run", side_effect=fake_run):
+            self.assertEqual(process_requests(config), 1)
+        self.assertEqual(calls, [("slyvie miles", "alive"), ("slyvie miles", "breathe"), ("slyvie miles", "fly"), ("slyvie miles", "get naughty")])
+        result = json.loads((requests_dir / "results" / "gridshift-tg-batch.json").read_text())
+        self.assertEqual(len(result["results"]), 4)
+        self.assertEqual([r["title"] for r in result["results"]], ["alive", "breathe", "fly", "get naughty"])
+        self.assertTrue(all(r["outcome"] == "added" for r in result["results"]))
+
     def test_process_requests_reports_failures_and_never_leaves_a_request_behind(self):
         config, requests_dir = self.request_config()
         (requests_dir / "a.json").write_text(json.dumps({"artist": "A", "title": "Song", "dry_run": True}))
@@ -279,7 +299,9 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(len(modes), 2)  # tried non-blocking, then waited
 
     def test_active_jellyfin_wal_is_visible_and_remains_unmodified(self):
-        database = self.root / "jellyfin.db"
+        data_dir = self.root / "jellyfin-data"
+        data_dir.mkdir()
+        database = data_dir / "jellyfin.db"
         writer = sqlite3.connect(database)
         writer.execute("PRAGMA journal_mode=WAL")
         writer.executescript("""CREATE TABLE BaseItems(Id TEXT,Name TEXT,Artists TEXT,
@@ -289,12 +311,38 @@ class DiscoveryTests(unittest.TestCase):
         writer.execute("INSERT INTO BaseItemProviders VALUES(?,?,?)", ("one", "MusicBrainzTrack", "recording-one"))
         writer.commit()
         before = writer.total_changes
-        catalog = Catalog(database, self.root)
-        self.assertTrue(catalog.contains({"artist": "A-HA", "title": "Take on me"}))
-        self.assertTrue(catalog.contains({"artist": "Alias", "title": "Alternate", "recording": "recording-one"}))
-        self.assertFalse(catalog.contains({"artist": "a-ha", "title": "Take On Me (Live)"}))
-        self.assertEqual(writer.total_changes, before)
-        writer.close()
+        data_dir.chmod(0o550)
+        try:
+            catalog = Catalog(database, self.root)
+            self.assertTrue(catalog.contains({"artist": "A-HA", "title": "Take on me"}))
+            self.assertTrue(catalog.contains({"artist": "Alias", "title": "Alternate", "recording": "recording-one"}))
+            self.assertFalse(catalog.contains({"artist": "a-ha", "title": "Take On Me (Live)"}))
+            self.assertEqual(writer.total_changes, before)
+        finally:
+            data_dir.chmod(0o750)
+            writer.close()
+
+    def test_checkpointed_jellyfin_wal_without_sidecars_opens_in_read_only_directory(self):
+        data_dir = self.root / "jellyfin-checkpointed"
+        data_dir.mkdir()
+        database = data_dir / "jellyfin.db"
+        writer = sqlite3.connect(database)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.executescript("""CREATE TABLE BaseItems(Id TEXT,Name TEXT,Artists TEXT,
+            AlbumArtists TEXT,Path TEXT,MediaType TEXT);
+            CREATE TABLE BaseItemProviders(ItemId TEXT,ProviderId TEXT,ProviderValue TEXT);""")
+        writer.execute("INSERT INTO BaseItems VALUES(?,?,?,?,?,?)", ("one", "Take On Me", "a-ha", "a-ha", str(self.root / "a-ha/song.mp3"), "Audio"))
+        writer.commit()
+        writer.close()  # closes cleanly and removes -wal/-shm sidecars while header stays in WAL mode
+        self.assertFalse(Path(str(database) + "-wal").exists())
+        data_dir.chmod(0o550)  # simulates ProtectSystem=strict on /var/lib/jellyfin/data
+        try:
+            catalog = Catalog(database, self.root)
+            self.assertTrue(catalog.contains({"artist": "a-ha", "title": "Take On Me"}))
+            self.assertFalse(Path(str(database) + "-wal").exists())
+            self.assertFalse(Path(str(database) + "-shm").exists())
+        finally:
+            data_dir.chmod(0o750)
 
     def test_unindexed_filename_duplicate_is_found(self):
         album = self.root / "A-ha" / "Hunting High and Low"
@@ -332,6 +380,30 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(info["id"], "s53hi2NrOik")
         self.assertEqual(track["url"], "https://www.youtube.com/watch?v=s53hi2NrOik")
         self.assertIn("ytsearch10:Modestep Another Day official audio", network.yt.call_args_list[0].args[0])
+
+    def test_unspecified_mix_prefers_original_over_remix_and_accepts_remix_fallback(self):
+        track = {"artist": "slyvie miles", "title": "the script"}
+        remix = {"id": "remix1", "title": "Sylvie Miles - The Script (Remix)", "channel": "Sylvie Miles", "duration": 300}
+        original = {"id": "loR63QZpX1w", "title": "Sylvie Miles - The Script (Original Mix)", "channel": "Sylvie Miles", "duration": 377}
+        self.assertTrue(recording_matches(original, track))
+        self.assertTrue(recording_matches(remix, track))
+        network = Mock()
+        network.config = {"minimum_duration": 60, "maximum_duration": 900, "youtube_search_results": 10}
+        network.yt.side_effect = [
+            json.dumps({"entries": [remix, original]}),
+            json.dumps({**original, "webpage_url": "https://www.youtube.com/watch?v=loR63QZpX1w"}),
+        ]
+        info = find_video(network, track)
+        self.assertEqual(info["id"], "loR63QZpX1w")
+        # When only a remix is available and no mix was specified, accept the remix.
+        network.yt.side_effect = [
+            json.dumps({"entries": [remix]}),
+            json.dumps({**remix, "webpage_url": "https://www.youtube.com/watch?v=remix1"}),
+            json.dumps({"entries": []}),
+        ]
+        track_remix_fallback = {"artist": "slyvie miles", "title": "the script"}
+        info_fallback = find_video(network, track_remix_fallback)
+        self.assertEqual(info_fallback["id"], "remix1")
 
     def test_trusted_official_channel_accepts_requested_remix(self):
         info = {"title": "Modestep - Another Day (Ft. Popeska) (xKore Remix) (Official Video)",
